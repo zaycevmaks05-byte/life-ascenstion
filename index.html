@@ -48,6 +48,11 @@ input,select,textarea{font-family:inherit}
 .xpfill::after{content:"";position:absolute;inset:0;background:linear-gradient(110deg,transparent 30%,rgba(255,255,255,.35) 50%,transparent 70%);transform:translateX(-100%);animation:shimmer 2.8s ease-in-out infinite}
 @keyframes shimmer{to{transform:translateX(100%)}}
 .xplabel{font-size:9px;color:#8b8fb8;margin:5px 0 14px}
+.echarge{display:flex;align-items:center;gap:7px;background:#0e0f24;border:1px solid #23264a;border-radius:20px;padding:5px 10px;margin-bottom:12px}
+.eicon{font-size:12px;flex-shrink:0}
+.etrack{flex:1;height:6px;border-radius:4px;background:#181a37;overflow:hidden}
+.efill{height:100%;transition:width .5s ease, background .5s ease}
+.epct{font-size:9px;font-weight:700;min-width:30px;text-align:right;flex-shrink:0}
 /* ── панели ── */
 .panel{background:linear-gradient(180deg,#14173a 0%,#101230 100%);border:1px solid #262a52;border-radius:14px;padding:14px;margin-bottom:10px;box-shadow:0 12px 30px -20px rgba(0,0,0,.9), inset 0 1px 0 #ffffff0d}
 .phead{display:flex;align-items:center;gap:6px;font-size:11px;letter-spacing:1px;color:#6f9ceb;margin-bottom:10px}
@@ -160,6 +165,8 @@ textarea.finput{min-height:110px;resize:vertical;font-size:10px;line-height:1.5}
 .ixp{font-size:8px;color:#8b8fb8}
 .settingsrow{display:flex;gap:8px;flex-wrap:wrap}
 .setbtn{font-size:10px;background:#0e0f24;border:1px solid #23264a;border-radius:8px;padding:8px 11px;color:#8b8fb8}
+.setbtn.restday-on{border-color:#4bc9a8;color:#4bc9a8;background:#4bc9a814}
+.panel.restday{border-color:#4bc9a855;box-shadow:0 12px 30px -20px rgba(0,0,0,.9), inset 0 1px 0 #ffffff0d, 0 0 0 1px #4bc9a822}
 .swatch{width:28px;height:28px;border-radius:50%;border:2px solid #23264a;padding:0;flex-shrink:0}
 .swatch.on{border-color:#4bc9a8;box-shadow:0 0 10px -2px #4bc9a888}
 .fineprint{font-size:8px;color:#454868;text-align:center;margin-top:14px;line-height:1.6}
@@ -319,6 +326,16 @@ const CONFIG = {
     { id: "rq_clean",       cat: "discipline", label: "Навести порядок на рабочем месте / в комнате", points: 6 },
     { id: "rq_deepwork",    cat: "discipline", label: "Час глубокой работы без отвлечений", points: 10 },
   ],
+
+  // ── ШКАЛА ЗАРЯДА (не путать со статом Энергия) ──────────────
+  // Отдельная 0-100% шкала, реагирует на твои отметки "Проснулся"/"Лёг спать",
+  // а не на часы суток — подстраивается под твой личный график.
+  ENERGY_CHARGE: {
+    DRAIN_HOURS: 16,          // за сколько часов бодрствования заряд падает со 100 до 0
+    LOW_THRESHOLD: 10,        // % и ниже считается "на нуле"
+    EXHAUST_MS: 4 * 3600 * 1000, // сколько суммарно быть "на нуле" за день, чтобы словить штраф
+    EXHAUST_PENALTY: { health: -5, intellect: -3 },
+  },
 
   // ── СТАТЫ И ДЕЙСТВИЯ ────────────────────────────────────────
   STATS: [
@@ -516,7 +533,7 @@ function newDaily(){
     const uq = CONFIG.URGENT.QUESTS[Math.floor(Math.random()*CONFIG.URGENT.QUESTS.length)];
     urgent = { id: uq.id, done: false };
   }
-  return { date: today(), checks: {}, claimed: false, urgent,
+  return { date: today(), checks: {}, claimed: false, restDay: false, urgent,
     random: pool.slice(0, CONFIG.RANDOM_QUESTS_PER_DAY).map(q => ({ id: q.id, done: false })) };
 }
 
@@ -531,35 +548,91 @@ function fresh(){
     seasonStart: today(), lastTitle: null,
     profile: { name: CONFIG.HERO_NAME, gender: "m", hair: "curtains", hairColor: "#5a3d26", skin: "#e8b58c", beard: true },
     weekly: { weekStart: weekMonday(), quests: [] },
+    energy: { pct: 100, lastTs: Date.now(), lowSinceTs: null, lowMsToday: 0, lowMsDate: today(), lastPenaltyDate: null },
     daily: newDaily(),
   };
 }
 
+/* migrate(): НИКОГДА не отбрасывает поля старого сейва молча.
+   Каждое поле переносится явно, с проверкой типа; отсутствующее —
+   берётся из fresh(). Так новые версии игры не могут стереть прогресс. */
 function migrate(s){
-  const f = fresh(), out = Object.assign({}, f, s);
-  out.stats = {}; CONFIG.STATS.forEach(c => out.stats[c.key] = { xp: (s.stats && s.stats[c.key] && +s.stats[c.key].xp) || 0 });
-  out.discipline = { xp: (s.discipline && +s.discipline.xp) || 0 };
-  out.skills = Object.assign({}, f.skills, s.skills || {});
-  out.equipped = Object.assign({}, f.equipped, s.equipped || {});
-  ["inventory","history","unlocked","perks","bossesDone"].forEach(k => { if(!Array.isArray(out[k])) out[k] = []; });
-  if(!out.daily || out.daily.date !== today()) out.daily = newDaily();
-  else {
-    if(!Array.isArray(out.daily.random) || !out.daily.random.length) out.daily.random = newDaily().random;
-    if(out.daily.urgent === undefined) out.daily.urgent = null;
+  const f = fresh();
+  if(!s || typeof s !== "object") return f;
+  const out = {};
+
+  out.v = 1;
+
+  out.stats = {};
+  CONFIG.STATS.forEach(c => {
+    const v = s.stats && s.stats[c.key] && Number.isFinite(+s.stats[c.key].xp) ? +s.stats[c.key].xp : 0;
+    out.stats[c.key] = { xp: v };
+  });
+
+  out.discipline = { xp: (s.discipline && Number.isFinite(+s.discipline.xp)) ? +s.discipline.xp : 0 };
+
+  out.skills = Object.assign({}, f.skills);
+  if(s.skills && typeof s.skills === "object"){
+    CONFIG.SKILLS.forEach(sk => { if(Number.isFinite(+s.skills[sk.key])) out.skills[sk.key] = Math.max(0, Math.min(100, +s.skills[sk.key])); });
   }
-  if(!out.weekly || !out.weekly.weekStart || !Array.isArray(out.weekly.quests)) out.weekly = { weekStart: weekMonday(), quests: [] };
-  out.profile = Object.assign({}, f.profile, s.profile || {});
-  if(!out.seasonStart) out.seasonStart = today();
-  if(out.lastTitle === undefined) out.lastTitle = null;
-  out.gold = Math.max(0, +out.gold || 0);
-  out.streak = Math.max(0, +out.streak || 0);
-  out.perfectDays = Math.max(0, +out.perfectDays || 0);
+
+  out.gold = Number.isFinite(+s.gold) ? Math.max(0, +s.gold) : f.gold;
+  out.inventory = Array.isArray(s.inventory) ? s.inventory.slice() : [];
+  out.equipped = Object.assign({}, f.equipped, (s.equipped && typeof s.equipped === "object") ? s.equipped : {});
+  out.history = Array.isArray(s.history) ? s.history.slice(0, 150) : [];
+  out.streak = Number.isFinite(+s.streak) ? Math.max(0, +s.streak) : 0;
+  out.lastLogDate = typeof s.lastLogDate === "string" ? s.lastLogDate : null;
+  out.unlocked = Array.isArray(s.unlocked) ? s.unlocked.slice() : [];
+  out.perks = Array.isArray(s.perks) ? s.perks.slice() : [];
+  out.perfectDays = Number.isFinite(+s.perfectDays) ? Math.max(0, +s.perfectDays) : 0;
+  out.bossesDone = Array.isArray(s.bossesDone) ? s.bossesDone.slice() : [];
+  out.seasonStart = typeof s.seasonStart === "string" ? s.seasonStart : today();
+  out.lastTitle = typeof s.lastTitle === "string" ? s.lastTitle : null;
+
+  out.profile = Object.assign({}, f.profile, (s.profile && typeof s.profile === "object") ? s.profile : {});
+
+  out.weekly = (s.weekly && typeof s.weekly === "object" && typeof s.weekly.weekStart === "string" && Array.isArray(s.weekly.quests))
+    ? { weekStart: s.weekly.weekStart, quests: s.weekly.quests.slice() }
+    : { weekStart: weekMonday(), quests: [] };
+
+  out.energy = Object.assign({}, f.energy, (s.energy && typeof s.energy === "object") ? s.energy : {});
+  if(!Number.isFinite(+out.energy.pct)) out.energy.pct = 100;
+  if(!Number.isFinite(+out.energy.lastTs)) out.energy.lastTs = Date.now();
+  if(out.energy.lowMsDate !== today()){ out.energy.lowMsToday = 0; out.energy.lowMsDate = today(); }
+
+  if(s.daily && typeof s.daily === "object" && s.daily.date === today()){
+    out.daily = {
+      date: s.daily.date,
+      checks: (s.daily.checks && typeof s.daily.checks === "object") ? s.daily.checks : {},
+      claimed: !!s.daily.claimed,
+      restDay: !!s.daily.restDay,
+      urgent: (s.daily.urgent && typeof s.daily.urgent === "object") ? s.daily.urgent : null,
+      random: (Array.isArray(s.daily.random) && s.daily.random.length) ? s.daily.random : newDaily().random,
+    };
+  } else {
+    out.daily = newDaily();
+  }
+
   return out;
 }
 
 function load(){
-  try { const raw = localStorage.getItem(KEY); return raw ? migrate(JSON.parse(raw)) : fresh(); }
-  catch(e){ return fresh(); }
+  let raw = null;
+  try { raw = localStorage.getItem(KEY); } catch(e){ return fresh(); }
+  if(!raw) return fresh();
+  try {
+    return migrate(JSON.parse(raw));
+  } catch(e){
+    // JSON битый — последний шанс: попытаться вытащить хоть что-то регуляркой,
+    // прежде чем сдаться и вернуть fresh(). Прогресс слишком ценен, чтобы
+    // терять его молча из-за одного повреждённого символа.
+    try {
+      const goldMatch = raw.match(/"gold":\s*(\d+)/);
+      const f = fresh();
+      if(goldMatch) f.gold = +goldMatch[1];
+      return f;
+    } catch(e2){ return fresh(); }
+  }
 }
 function persist(){ try { localStorage.setItem(KEY, JSON.stringify(S)); } catch(e){} }
 
@@ -591,6 +664,59 @@ function applyStatDelta(cat, delta){
   else if(S.stats[cat]) S.stats[cat].xp += delta;
 }
 function catCfg(cat){ return cat === "discipline" ? CONFIG.DISCIPLINE : CONFIG.STATS.find(c => c.key === cat); }
+
+/* ── шкала заряда (0-100%, реагирует на отметки, не на часы суток) ── */
+function energyRecalc(){
+  const E = S.energy;
+  if(!E) return;
+  const now = Date.now();
+  if(E.lowMsDate !== today()){ E.lowMsToday = 0; E.lowMsDate = today(); }
+
+  if(E.asleep){
+    E.lastTs = now; // на паузе, pct не меняется пока спит
+    return;
+  }
+  const elapsedH = Math.max(0, (now - E.lastTs) / 3600000);
+  const dropped = (elapsedH / CONFIG.ENERGY_CHARGE.DRAIN_HOURS) * 100;
+  const wasLow = E.pct <= CONFIG.ENERGY_CHARGE.LOW_THRESHOLD;
+  E.pct = Math.max(0, Math.min(100, E.pct - dropped));
+  const isLow = E.pct <= CONFIG.ENERGY_CHARGE.LOW_THRESHOLD;
+
+  if(isLow){
+    E.lowMsToday += (now - E.lastTs);
+  }
+  E.lastTs = now;
+
+  if(E.lowMsToday >= CONFIG.ENERGY_CHARGE.EXHAUST_MS && E.lastPenaltyDate !== today()){
+    E.lastPenaltyDate = today();
+    const pen = CONFIG.ENERGY_CHARGE.EXHAUST_PENALTY;
+    Object.keys(pen).forEach(cat => {
+      applyStatDelta(cat, pen[cat]);
+      S.history.unshift({ ts: now, cat, label: "⚙ Истощение: слишком долго на нуле энергии", points: pen[cat], gold: 0, sys: true });
+    });
+    toast("⚙ СИСТЕМА · Истощение: организм на пределе", "bad");
+  }
+}
+function energyWake(){
+  S.energy.pct = 100;
+  S.energy.lastTs = Date.now();
+  S.energy.asleep = false;
+  persist(); render();
+  toast("☀️ Заряд восстановлен: 100%");
+}
+function energySleep(){
+  energyRecalc();
+  S.energy.asleep = true;
+  S.energy.lastTs = Date.now();
+  persist(); render();
+  toast("🌙 Отмечен сон — заряд на паузе");
+}
+function energySpend(amount, label){
+  energyRecalc();
+  S.energy.pct = Math.max(0, S.energy.pct - amount);
+  persist();
+  if(label) toast("⚡ " + label + " · заряд −" + amount + "%");
+}
 
 /* ── профиль персонажа ── */
 function shade(hex, f){
@@ -832,16 +958,40 @@ function wqDelete(id){
 function toggleQuest(key){
   ensureDailyFresh();
   S.daily.checks[key] = !S.daily.checks[key];
-  const all = CONFIG.DAILY_QUESTS.every(q => S.daily.checks[q.key]);
-  if(all && !S.daily.claimed){
+  const allChecked = CONFIG.DAILY_QUESTS.every(q => S.daily.checks[q.key]);
+  const anyChecked = CONFIG.DAILY_QUESTS.some(q => S.daily.checks[q.key]);
+  const qualifies = S.daily.restDay ? anyChecked : allChecked;
+  if(qualifies && !S.daily.claimed){
     S.daily.claimed = true;
     S.discipline.xp += CONFIG.PERFECT_DAY.xp;
     S.gold += CONFIG.PERFECT_DAY.gold;
     S.perfectDays++;
     touchDay();
-    S.history.unshift({ ts: Date.now(), cat: "discipline", label: "🌟 Perfect Day — все квесты закрыты", points: CONFIG.PERFECT_DAY.xp, gold: CONFIG.PERFECT_DAY.gold, sys: true });
-    toast("🌟 Perfect Day! +" + CONFIG.PERFECT_DAY.xp + " XP · +" + CONFIG.PERFECT_DAY.gold + "🪙", "sys");
+    const label = S.daily.restDay ? "🌴 День отдыха — стрик сохранён" : "🌟 Perfect Day — все квесты закрыты";
+    S.history.unshift({ ts: Date.now(), cat: "discipline", label, points: CONFIG.PERFECT_DAY.xp, gold: CONFIG.PERFECT_DAY.gold, sys: true });
+    toast((S.daily.restDay ? "🌴 День отдыха засчитан" : "🌟 Perfect Day") + "! +" + CONFIG.PERFECT_DAY.xp + " XP · +" + CONFIG.PERFECT_DAY.gold + "🪙", "sys");
     checkBosses(); checkAch(); checkTitle();
+  }
+  persist(); render();
+}
+
+function toggleRestDay(){
+  ensureDailyFresh();
+  S.daily.restDay = !S.daily.restDay;
+  if(S.daily.restDay){
+    touchDay(); // сам факт "дня отдыха" сохраняет стрик, даже если ни один квест не отмечен
+    toast("🌴 День отдыха включён — стрик сохранён, штрафов не будет", "sys");
+    const anyChecked = CONFIG.DAILY_QUESTS.some(q => S.daily.checks[q.key]);
+    if(anyChecked && !S.daily.claimed){
+      S.daily.claimed = true;
+      S.discipline.xp += CONFIG.PERFECT_DAY.xp;
+      S.gold += CONFIG.PERFECT_DAY.gold;
+      S.perfectDays++;
+      S.history.unshift({ ts: Date.now(), cat: "discipline", label: "🌴 День отдыха — стрик сохранён", points: CONFIG.PERFECT_DAY.xp, gold: CONFIG.PERFECT_DAY.gold, sys: true });
+      checkBosses(); checkAch(); checkTitle();
+    }
+  } else {
+    toast("Режим дня отдыха выключен");
   }
   persist(); render();
 }
@@ -1100,8 +1250,16 @@ function heroSVG(size){
 }
 
 /* ── РЕНДЕР ── */
+function energyBarColor(pct){
+  if(pct <= 15) return "#e6584f";
+  if(pct <= 40) return "#e8b84b";
+  return "#4bc9a8";
+}
 function topbarHTML(){
+  energyRecalc();
   const o = overall();
+  const E = S.energy;
+  const eColor = energyBarColor(E.pct);
   return '<header class="top"><div>'+
     '<div class="eyebrow">LIFE: ASCENSION · <span id="clock">'+fmtClock()+'</span> · ДЕНЬ '+seasonDay()+'/'+CONFIG.SEASON_LENGTH+'</div>'+
     '<div class="titlerow"><span class="title">'+esc(heroName().toUpperCase())+'</span><span class="hard">💀 HARD</span></div>'+
@@ -1110,7 +1268,12 @@ function topbarHTML(){
     '<div class="lvl">УР. '+o.level+' · '+o.rank+'</div>'+
     '</div></header>'+
     '<div class="xptrack"><div class="xpfill" style="width:'+o.progress+'%"></div></div>'+
-    '<div class="xplabel">'+o.into+'/'+o.need+' XP · стрик '+S.streak+'🔥 · дисциплина +'+Math.round(discBonus()*100)+'%</div>';
+    '<div class="xplabel">'+o.into+'/'+o.need+' XP · стрик '+S.streak+'🔥 · дисциплина +'+Math.round(discBonus()*100)+'%</div>'+
+    '<div class="echarge" data-act="openlog" data-cat="__energy">'+
+    '<span class="eicon">'+(E.asleep ? '🌙' : '⚡')+'</span>'+
+    '<div class="etrack"><div class="efill" style="width:'+Math.round(E.pct)+'%;background:'+eColor+'"></div></div>'+
+    '<span class="epct" style="color:'+eColor+'">'+Math.round(E.pct)+'%</span>'+
+    '</div>';
 }
 
 function heroTab(){
@@ -1152,7 +1315,7 @@ function heroTab(){
     '<button class="setbtn" data-act="undo">↩️ Отменить последнее</button>'+
     '<button class="setbtn" data-act="rollopen">⏪ Откат</button>'+
     '</div><div class="hint">Прогресс хранится в памяти этого браузера. Точка отката создаётся автоматически при первом заходе каждый день. Экспорт — резервная копия; этот текст можно кидать Claude, чтобы он посмотрел прогресс и собрал обновление игры.</div></div>'+
-    '<div class="fineprint">LIFE: ASCENSION · движок v3.1 · Hard Mode</div>';
+    '<div class="fineprint">LIFE: ASCENSION · движок v4.0 · Hard Mode</div>';
 }
 
 function questsTab(){
@@ -1176,7 +1339,11 @@ function questsTab(){
   }
 
   const done = CONFIG.DAILY_QUESTS.filter(q => S.daily.checks[q.key]).length;
-  html += '<div class="panel"><div class="phead">📋 КВЕСТЫ ДНЯ ('+done+'/'+CONFIG.DAILY_QUESTS.length+')</div>';
+  html += '<div class="panel'+(S.daily.restDay?' restday':'')+'"><div class="phead" style="justify-content:space-between">'+
+    '<span>📋 КВЕСТЫ ДНЯ ('+done+'/'+CONFIG.DAILY_QUESTS.length+')</span>'+
+    '<button class="setbtn'+(S.daily.restDay?" restday-on":"")+'" data-act="restday">🌴 '+(S.daily.restDay?"День отдыха ✓":"День отдыха")+'</button>'+
+    '</div>';
+  if(S.daily.restDay) html += '<div class="hint" style="color:#8fd9c4">Режим отдыха: отметь только то, что реально сделал — остальное не тронет стрик и не даст штраф. Даже если не отметишь ничего, стрик всё равно сохранится.</div>';
   html += CONFIG.DAILY_QUESTS.map(q => {
     const d = !!S.daily.checks[q.key];
     return '<button class="qrow" data-act="quest" data-key="'+q.key+'">'+
@@ -1184,8 +1351,10 @@ function questsTab(){
       '<span class="'+(d?'done':'')+'">'+esc(q.label)+'</span></button>';
   }).join("");
   html += S.daily.claimed
-    ? '<div class="hint ok">✓ Perfect Day получен (+'+CONFIG.PERFECT_DAY.xp+' XP, +'+CONFIG.PERFECT_DAY.gold+'🪙)</div>'
-    : '<div class="hint">Закрой все '+CONFIG.DAILY_QUESTS.length+' → Perfect Day: +'+CONFIG.PERFECT_DAY.xp+' XP, +'+CONFIG.PERFECT_DAY.gold+'🪙</div>';
+    ? '<div class="hint ok">✓ '+(S.daily.restDay?"День отдыха засчитан":"Perfect Day получен")+' (+'+CONFIG.PERFECT_DAY.xp+' XP, +'+CONFIG.PERFECT_DAY.gold+'🪙)</div>'
+    : (S.daily.restDay
+        ? '<div class="hint">Отметь хотя бы один пункт → бонус +'+CONFIG.PERFECT_DAY.xp+' XP, +'+CONFIG.PERFECT_DAY.gold+'🪙 (стрик уже сохранён)</div>'
+        : '<div class="hint">Закрой все '+CONFIG.DAILY_QUESTS.length+' → Perfect Day: +'+CONFIG.PERFECT_DAY.xp+' XP, +'+CONFIG.PERFECT_DAY.gold+'🪙</div>');
   html += '</div>';
 
   const rlist = S.daily.random || [];
@@ -1357,6 +1526,18 @@ function modalHTML(){
   if(!UI.modal) return "";
   let inner = "";
 
+  if(UI.modal === "energy"){
+    const E = S.energy;
+    const eColor = energyBarColor(E.pct);
+    inner = '<div class="mhead"><span>⚡ Заряд</span><button class="xbtn" data-act="closemodal">✕</button></div>'+
+      '<div class="mnote">Отдельная шкала самочувствия, не влияет на XP/статы напрямую. Падает не по часам суток, а от твоих отметок «проснулся» / «лёг спать».</div>'+
+      '<div style="text-align:center;font-size:28px;font-weight:700;color:'+eColor+';margin:6px 0 10px">'+Math.round(E.pct)+'%</div>'+
+      (E.asleep
+        ? '<button class="submit" data-act="energywake">☀️ Я проснулся — сбросить на 100%</button>'
+        : '<button class="submit" data-act="energysleep" style="background:linear-gradient(90deg,#3d5fa8,#6f9ceb)">🌙 Ложусь спать — поставить на паузу</button>')+
+      '<div class="hint">Заряд тратится примерно за '+CONFIG.ENERGY_CHARGE.DRAIN_HOURS+' часов бодрствования. Тренировки списывают дополнительный кусок. Если долго держится на нуле ('+Math.round(CONFIG.ENERGY_CHARGE.EXHAUST_MS/3600000)+'+ч суммарно за день) — заметно проседают Здоровье и Интеллект.</div>';
+  }
+
   if(UI.modal === "log"){
     const cfg = catCfg(UI.modalCat);
     inner = '<div class="mhead"><span>'+cfg.icon+' '+cfg.name+'</span><button class="xbtn" data-act="closemodal">✕</button></div>'+
@@ -1497,7 +1678,12 @@ document.addEventListener("click", e => {
   if(act === "noop") { e.stopPropagation(); return; }
   switch(act){
     case "tab": UI.tab = el.dataset.tab; render(); break;
-    case "openlog": UI.modal = "log"; UI.modalCat = el.dataset.cat; render(); break;
+    case "openlog": {
+      if(el.dataset.cat === "__energy"){ UI.modal = "energy"; render(); break; }
+      UI.modal = "log"; UI.modalCat = el.dataset.cat; render(); break;
+    }
+    case "energywake": energyWake(); break;
+    case "energysleep": energySleep(); break;
     case "closemodal": UI.modal = null; render(); break;
     case "log": {
       const cfg = catCfg(el.dataset.cat);
@@ -1508,10 +1694,14 @@ document.addEventListener("click", e => {
     case "phys": UI.physLv = +el.dataset.lv; render(); break;
     case "physlog": {
       const p = CONFIG.PHYSICAL_INTENSITY.find(x => x.level === UI.physLv);
-      if(p) logAction("health", "Физическая активность · интенсивность "+p.level+"/5", p.xp, null, "physical");
+      if(p){
+        logAction("health", "Физическая активность · интенсивность "+p.level+"/5", p.xp, null, "physical");
+        energySpend(p.level * 4, null);
+      }
       break;
     }
     case "quest": toggleQuest(el.dataset.key); break;
+    case "restday": toggleRestDay(); break;
     case "rquest": doRandomQuest(el.dataset.id); break;
     case "urgent": doUrgent(); break;
     case "wqopen": UI.modal = "wqadd"; render(); break;
