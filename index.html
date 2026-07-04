@@ -265,17 +265,17 @@ const CONFIG = {
     // ❤️ Здоровье
     { id: "rq_water",       cat: "health", label: "Выпить 2+ литра воды за день", points: 5 },
     { id: "rq_nosugar",     cat: "health", label: "День без сахара и сладкого", points: 10 },
-    { id: "rq_sleep23",     cat: "health", label: "Лечь спать до 23:00", points: 8 },
+    { id: "rq_sleep23",     cat: "health", label: "Лечь спать до 23:00", points: 8, energyDelta: 10 },
     { id: "rq_steps",       cat: "health", label: "10 000 шагов за день", points: 12 },
     { id: "rq_shower",      cat: "health", label: "Контрастный душ", points: 6 },
     { id: "rq_noenergy",    cat: "health", label: "День без энергетиков и кофе после 16:00", points: 8 },
     { id: "rq_cook",        cat: "health", label: "Приготовить еду самому вместо заказа", points: 8 },
     { id: "rq_stretch",     cat: "health", label: "Растяжка 10 минут перед сном", points: 6 },
     // ⚡ Энергия
-    { id: "rq_nophone_am",  cat: "energy", label: "20 минут без телефона после пробуждения", points: 8 },
-    { id: "rq_walk",        cat: "energy", label: "Прогулка на свежем воздухе 20+ минут", points: 6 },
-    { id: "rq_nap",         cat: "energy", label: "Осознанный отдых 20 минут (без экрана)", points: 5 },
-    { id: "rq_noscreens",   cat: "energy", label: "Без экранов за час до сна", points: 10 },
+    { id: "rq_nophone_am",  cat: "energy", label: "20 минут без телефона после пробуждения", points: 8, energyDelta: 8 },
+    { id: "rq_walk",        cat: "energy", label: "Прогулка на свежем воздухе 20+ минут", points: 6, energyDelta: 10 },
+    { id: "rq_nap",         cat: "energy", label: "Осознанный отдых 20 минут (без экрана)", points: 5, energyDelta: 15 },
+    { id: "rq_noscreens",   cat: "energy", label: "Без экранов за час до сна", points: 10, energyDelta: 8 },
     { id: "rq_nodoom",      cat: "energy", label: "Ни одного думскроллинга в перерывах", points: 8 },
     // 🧠 Интеллект
     { id: "rq_words10",     cat: "intellect", label: "Выучить 10 новых английских слов", points: 10, skill: "english", tag: "study" },
@@ -338,21 +338,24 @@ const CONFIG = {
   },
 
   // ── СТАТЫ И ДЕЙСТВИЯ ────────────────────────────────────────
+  // energyDelta (необязательное поле): на сколько % меняет шкалу Заряда
+  // при логировании этого действия. Положительное — восстанавливает,
+  // отрицательное — тратит. Никак не связано с Hard-модификатором XP.
   STATS: [
     { key: "health", name: "Здоровье", icon: "❤️", color: "#e6584f",
       actions: [
-        { label: "8 часов сна", points: 5 },
-        { label: "Чистое питание весь день", points: 5 },
-        { label: "Недосып (<5ч)", points: -5 },
-        { label: "Фастфуд / срыв питания", points: -5 },
-        { label: "Заболел", points: -10 },
+        { label: "8 часов сна", points: 5, energyDelta: 40 },
+        { label: "Чистое питание весь день", points: 5, energyDelta: 5 },
+        { label: "Недосып (<5ч)", points: -5, energyDelta: -25 },
+        { label: "Фастфуд / срыв питания", points: -5, energyDelta: -5 },
+        { label: "Заболел", points: -10, energyDelta: -30 },
       ]},
     { key: "energy", name: "Энергия", icon: "⚡", color: "#f0d24b",
       actions: [
-        { label: "Хорошо отдохнул сегодня", points: 5 },
-        { label: "Осознанный перерыв в течение дня", points: 5 },
-        { label: "Переработал без отдыха", points: -10 },
-        { label: "Лёг очень поздно", points: -8 },
+        { label: "Хорошо отдохнул сегодня", points: 5, energyDelta: 15 },
+        { label: "Осознанный перерыв в течение дня", points: 5, energyDelta: 10 },
+        { label: "Переработал без отдыха", points: -10, energyDelta: -20 },
+        { label: "Лёг очень поздно", points: -8, energyDelta: -15 },
       ]},
     { key: "intellect", name: "Интеллект", icon: "🧠", color: "#6f9ceb",
       actions: [
@@ -822,7 +825,7 @@ function checkLevelUp(prevTotal){
   }
 }
 
-function logAction(cat, label, basePoints, skill, tag, meta){
+function logAction(cat, label, basePoints, skill, tag, meta, energyDelta){
   const prevTotal = totalXp(S);
   let pts, gold;
   if(basePoints > 0){
@@ -842,15 +845,26 @@ function logAction(cat, label, basePoints, skill, tag, meta){
     S.skills[skill] = Math.min(100, beforeSkill + Math.max(1, Math.round(basePoints * CONFIG.SKILL_GAIN_RATIO)));
     skillGain = S.skills[skill] - beforeSkill;
   }
+
+  let appliedEnergy = 0;
+  if(energyDelta){
+    energyRecalc();
+    const before = S.energy.pct;
+    S.energy.pct = Math.max(0, Math.min(100, S.energy.pct + energyDelta));
+    appliedEnergy = S.energy.pct - before;
+  }
+
   touchDay();
   const entry = { ts: Date.now(), cat, label, points: pts, gold, tag: tag || null };
   if(skill && skillGain) { entry.skill = skill; entry.skillGain = skillGain; }
   if(meta && meta.rq) entry.rq = meta.rq;
+  if(appliedEnergy) entry.energyDelta = appliedEnergy;
   S.history.unshift(entry);
   if(S.history.length > 150) S.history.length = 150;
 
-  if(pts < 0) toast(pts + " XP · " + gold + "🪙 — Hard Mode не прощает", "bad");
-  else toast("+" + pts + " XP · +" + gold + "🪙");
+  const energySuffix = appliedEnergy ? (" · ⚡" + (appliedEnergy > 0 ? "+" : "") + Math.round(appliedEnergy) + "%") : "";
+  if(pts < 0) toast(pts + " XP · " + gold + "🪙" + energySuffix + " — Hard Mode не прощает", "bad");
+  else toast("+" + pts + " XP · +" + gold + "🪙" + energySuffix);
 
   checkLevelUp(prevTotal);
   checkBosses();
@@ -1004,7 +1018,7 @@ function doRandomQuest(id){
   if(!q) return;
   entry.done = true;
   const allDone = S.daily.random.every(r => r.done);
-  logAction(q.cat, "🎲 " + q.label, q.points, q.skill || null, q.tag || null, { rq: id });
+  logAction(q.cat, "🎲 " + q.label, q.points, q.skill || null, q.tag || null, { rq: id }, q.energyDelta || 0);
   if(allDone) setTimeout(() => toast("🎲 Все рандом-квесты дня закрыты!"), 500);
 }
 
@@ -1051,6 +1065,7 @@ function undoLast(){
   applyStatDelta(h.cat, -h.points);
   S.gold = Math.max(0, S.gold - (h.gold || 0));
   if(h.skill && h.skillGain) S.skills[h.skill] = Math.max(0, (S.skills[h.skill] || 0) - h.skillGain);
+  if(h.energyDelta) S.energy.pct = Math.max(0, Math.min(100, S.energy.pct - h.energyDelta));
   if(h.rq){ const e = (S.daily.random || []).find(r => r.id === h.rq); if(e) e.done = false; }
   if(h.uq && S.daily.urgent && S.daily.urgent.id === h.uq) S.daily.urgent.done = false;
   if(h.wq){ const q = S.weekly.quests.find(x => x.id === h.wq); if(q){ q.done = false; q.progress = Math.max(0, q.target - 1); } }
@@ -1315,7 +1330,7 @@ function heroTab(){
     '<button class="setbtn" data-act="undo">↩️ Отменить последнее</button>'+
     '<button class="setbtn" data-act="rollopen">⏪ Откат</button>'+
     '</div><div class="hint">Прогресс хранится в памяти этого браузера. Точка отката создаётся автоматически при первом заходе каждый день. Экспорт — резервная копия; этот текст можно кидать Claude, чтобы он посмотрел прогресс и собрал обновление игры.</div></div>'+
-    '<div class="fineprint">LIFE: ASCENSION · движок v4.0 · Hard Mode</div>';
+    '<div class="fineprint">LIFE: ASCENSION · движок v4.1 · Hard Mode</div>';
 }
 
 function questsTab(){
@@ -1364,10 +1379,11 @@ function questsTab(){
     const q = CONFIG.RANDOM_QUESTS.find(x => x.id === r.id);
     if(!q) return "";
     const cat = catCfg(q.cat);
+    const eHint = q.energyDelta ? ' ⚡'+(q.energyDelta>0?"+":"")+q.energyDelta+'%' : "";
     return '<button class="qrow" data-act="rquest" data-id="'+q.id+'">'+
       '<span class="qmark">'+(r.done ? '<span class="ok">✔</span>' : '🎲')+'</span>'+
       '<span class="'+(r.done ? 'done' : '')+'" style="flex:1">'+esc(q.label)+'</span>'+
-      '<span class="qreward" style="color:'+cat.color+'">'+cat.icon+' +'+effGain(q.points, q.cat)+'</span></button>';
+      '<span class="qreward" style="color:'+cat.color+'">'+cat.icon+' +'+effGain(q.points, q.cat)+eHint+'</span></button>';
   }).join("");
   html += '<div class="hint">Каждый день — три новых случайных квеста. Выполнил — тапни.</div></div>';
 
@@ -1557,8 +1573,9 @@ function modalHTML(){
 
     inner += cfg.actions.map((a,i) => {
       const shown = a.points > 0 ? "+"+effGain(a.points, cfg.key) : String(effPenalty(a.points));
+      const eHint = a.energyDelta ? ' <span style="opacity:.7;font-weight:400">· ⚡'+(a.energyDelta>0?"+":"")+a.energyDelta+'%</span>' : "";
       return '<button class="act '+(a.points>0?"pos":"neg")+'" data-act="log" data-cat="'+cfg.key+'" data-idx="'+i+'">'+
-        '<span>'+esc(a.label)+'</span><span style="font-weight:700">'+shown+'</span></button>';
+        '<span>'+esc(a.label)+'</span><span style="font-weight:700">'+shown+eHint+'</span></button>';
     }).join("");
     inner += '<button class="custom" data-act="customopen" data-cat="'+cfg.key+'">＋ своё действие</button>';
   }
@@ -1688,7 +1705,7 @@ document.addEventListener("click", e => {
     case "log": {
       const cfg = catCfg(el.dataset.cat);
       const a = cfg.actions[+el.dataset.idx];
-      if(a) logAction(cfg.key, a.label, a.points, a.skill || null, a.tag || null);
+      if(a) logAction(cfg.key, a.label, a.points, a.skill || null, a.tag || null, null, a.energyDelta || 0);
       break;
     }
     case "phys": UI.physLv = +el.dataset.lv; render(); break;
